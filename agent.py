@@ -1,8 +1,9 @@
 import inspect
 import json
 import os
+import time
 
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 from dotenv import load_dotenv
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -36,6 +37,18 @@ If no action is needed, respond in plain prose.
 YOU_COLOR = "\u001b[94m"
 ASSISTANT_COLOR = "\u001b[93m"
 RESET_COLOR = "\u001b[0m"
+
+TRACE_FILE = "trace.txt"
+
+def log_trace(text: str):
+    with open(TRACE_FILE, "a", encoding="utf-8") as f:
+        f.write(text + "\n")
+
+def extract_thought(text: str) -> str:
+    """Texto do modelo sem as linhas 'tool: ...' que o parser reconheceu.
+    Linhas 'tool:' malformadas permanecem, para evidenciar falhas de parsing."""
+    lines = [l for l in text.splitlines() if not extract_tool_invocations(l)]
+    return "\n".join(lines).strip()
 
 def resolve_abs_path(path_str: str) -> Path:
     """
@@ -154,12 +167,20 @@ def extract_tool_invocations(text: str) -> List[Tuple[str, Dict[str, Any]]]:
     return invocations
 
 def execute_llm_call(conversation: List[Dict[str, str]]):
-    response = openai_client.chat.completions.create(
-        model="qwen/qwen3.8-27b",
-        messages=conversation,
-        max_completion_tokens=2000
-    )
-    return response.choices[0].message.content
+    # O plano gratuito do Groq limita a saída a 1000 tokens/minuto (OTPM):
+    # cada chamada precisa caber nisso, e ao estourar o limite esperamos e tentamos de novo.
+    for attempt in range(5):
+        try:
+            response = openai_client.chat.completions.create(
+                model="qwen/qwen3.8-27b",
+                messages=conversation,
+                max_completion_tokens=900
+            )
+            return response.choices[0].message.content
+        except RateLimitError:
+            print(f"[rate limit do Groq] aguardando 60s (tentativa {attempt + 1}/5)...")
+            time.sleep(60)
+    raise RuntimeError("Rate limit do Groq persistiu após 5 tentativas")
 
 def run_coding_agent_loop():
     print(get_full_system_prompt())
@@ -176,20 +197,29 @@ def run_coding_agent_loop():
             "role": "user",
             "content": user_input.strip()
         })
+        log_trace(f"\n{'#' * 60}\nUSER: {user_input.strip()}\n{'#' * 60}")
+        iteration = 0
         while True:
+            iteration += 1
             assistant_response = execute_llm_call(conversation)
             tool_invocations = extract_tool_invocations(assistant_response)
+            log_trace(f"\n===== Iteração {iteration} =====")
+            log_trace(f"Thought:\n{extract_thought(assistant_response) or '(vazio)'}")
+            # A resposta do assistente entra na conversa mesmo quando tem tool calls,
+            # para que o LLM veja o próprio raciocínio nas chamadas seguintes.
+            conversation.append({
+                "role": "assistant",
+                "content": assistant_response
+            })
             if not tool_invocations:
                 print(f"{ASSISTANT_COLOR}Assistant:{RESET_COLOR}: {assistant_response}")
-                conversation.append({
-                    "role": "assistant",
-                    "content": assistant_response
-                })
+                log_trace("Action: nenhuma (resposta final)")
                 break
             for name, args in tool_invocations:
                 tool = TOOL_REGISTRY[name]
                 resp = ""
                 print(name, args)
+                log_trace(f"Action: {name}({json.dumps(args, ensure_ascii=False)})")
                 if name == "read_file":
                     resp = tool(args.get("filename", "."))
                 elif name == "list_files":
@@ -198,9 +228,11 @@ def run_coding_agent_loop():
                     resp = tool(args.get("path", "."),
                                 args.get("old_str", ""),
                                 args.get("new_str", ""))
+                observation = f"tool_result({json.dumps(resp)})"
+                log_trace(f"Observation:\n{observation}")
                 conversation.append({
                     "role": "user",
-                    "content": f"tool_result({json.dumps(resp)})"
+                    "content": observation
                 })
 
 
